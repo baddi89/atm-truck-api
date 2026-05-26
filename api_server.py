@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import re
 from datetime import datetime
 
 import firebase_admin
@@ -10,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="ATM TRUCK API", version="1.0.0")
+app = FastAPI(title="ATM TRUCK API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,6 +53,68 @@ def initialize_firebase():
 db = initialize_firebase()
 
 
+# -------------------- Phone normalization --------------------
+def normalize_phone(phone: str) -> str:
+    """
+    يوحّد رقم الهاتف حتى لا يضيع الـ history بسبب اختلاف الكتابة:
+    0550 00 00 00  -> 0550000000
+    +213550000000  -> 0550000000
+    213550000000   -> 0550000000
+    """
+    if phone is None:
+        return ""
+
+    p = str(phone).strip()
+    p = re.sub(r"[\s\-\.\(\)]", "", p)
+
+    if p.startswith("00"):
+        p = "+" + p[2:]
+
+    if p.startswith("+213"):
+        p = "0" + p[4:]
+    elif p.startswith("213"):
+        p = "0" + p[3:]
+
+    return p
+
+
+def phone_candidates(phone: str) -> list[str]:
+    """
+    للبحث عن الطلبات القديمة والجديدة معًا.
+    مهم جدًا إذا كانت طلبات قديمة مخزنة بصيغة مختلفة.
+    """
+    raw = str(phone or "").strip()
+    normalized = normalize_phone(raw)
+
+    candidates = {raw, normalized}
+
+    # إذا الرقم محلي 0XXXXXXXXX، أضف صيغ +213 و 213 للطلبات القديمة المحتملة.
+    if normalized.startswith("0") and len(normalized) >= 10:
+        without_zero = normalized[1:]
+        candidates.add("+213" + without_zero)
+        candidates.add("213" + without_zero)
+
+    # أضف نسخة بدون فراغات ورموز بسيطة.
+    compact_raw = re.sub(r"[\s\-\.\(\)]", "", raw)
+    if compact_raw:
+        candidates.add(compact_raw)
+
+    return [c for c in candidates if c]
+
+
+def safe_strip(value):
+    return str(value or "").strip()
+
+
+def parse_created_at(order: dict):
+    """ترتيب احتياطي إذا لم نستعمل order_by من Firestore."""
+    created_at = order.get("created_at", "")
+    try:
+        return datetime.strptime(created_at, "%d/%m/%Y %H:%M")
+    except Exception:
+        return datetime.min
+
+
 class OrderData(BaseModel):
     client_name: str = Field(..., min_length=1)
     client_phone: str = Field(..., min_length=6)
@@ -72,25 +135,34 @@ def health_check():
     return {
         "success": True,
         "service": "ATM TRUCK API",
-        "status": "online"
+        "status": "online",
+        "version": "1.1.0"
     }
+
+
+@app.head("/")
+def health_check_head():
+    # لتفادي ظهور 405 Method Not Allowed في Render Health Check.
+    return None
 
 
 @app.post("/orders")
 def create_order(order: OrderData):
     try:
         order_id = str(uuid.uuid4())
+        normalized_phone = normalize_phone(order.client_phone)
 
         data = {
-            "client_name": order.client_name.strip(),
-            "client_phone": order.client_phone.strip(),
-            "company": order.company.strip(),
-            "location_from": order.location_from.strip(),
-            "location_to": order.location_to.strip(),
-            "cargo": order.cargo.strip(),
-            "truck": order.truck.strip(),
-            "date": order.date.strip(),
-            "time": order.time.strip(),
+            "client_name": safe_strip(order.client_name),
+            "client_phone": normalized_phone,
+            "client_phone_raw": safe_strip(order.client_phone),
+            "company": safe_strip(order.company),
+            "location_from": safe_strip(order.location_from),
+            "location_to": safe_strip(order.location_to),
+            "cargo": safe_strip(order.cargo),
+            "truck": safe_strip(order.truck),
+            "date": safe_strip(order.date),
+            "time": safe_strip(order.time),
             "manutention": order.manutention,
             "person_count": order.person_count or "",
             "admin_note": order.admin_note or "",
@@ -119,21 +191,59 @@ def create_order(order: OrderData):
 @app.get("/orders/{phone}")
 def get_orders_by_phone(phone: str):
     try:
-        docs = (
-            db.collection("orders")
-            .where("client_phone", "==", phone)
-            .stream()
-        )
+        candidates = phone_candidates(phone)
 
+        orders_by_id = {}
+
+        # نبحث بعدة صيغ للرقم حتى تظهر الطلبات القديمة والجديدة.
+        for candidate in candidates:
+            docs = (
+                db.collection("orders")
+                .where("client_phone", "==", candidate)
+                .stream()
+            )
+
+            for doc in docs:
+                data = doc.to_dict() or {}
+                data["id"] = doc.id
+                orders_by_id[doc.id] = data
+
+        orders = list(orders_by_id.values())
+        orders.sort(key=parse_created_at, reverse=True)
+
+        return {
+            "success": True,
+            "phone_received": phone,
+            "phone_normalized": normalize_phone(phone),
+            "orders": orders
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/debug/orders")
+def debug_orders():
+    """
+    Endpoint للتشخيص فقط:
+    يعرض آخر الطلبات الموجودة في Firestore.
+    إذا المشروع دخل Production حقيقي، احذفه أو احميه بكلمة مرور.
+    """
+    try:
+        docs = db.collection("orders").stream()
         orders = []
+
         for doc in docs:
             data = doc.to_dict() or {}
             data["id"] = doc.id
             orders.append(data)
 
+        orders.sort(key=parse_created_at, reverse=True)
+
         return {
             "success": True,
-            "orders": orders
+            "count": len(orders),
+            "orders": orders[:100]
         }
 
     except Exception as e:
