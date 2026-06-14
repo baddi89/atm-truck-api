@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="ATM TRUCK API", version="1.1.0")
+app = FastAPI(title="ATM TRUCK API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -130,13 +130,82 @@ class OrderData(BaseModel):
     admin_note: str | None = ""
 
 
+class ClientMessageData(BaseModel):
+    """Payload تاع رسالة الزبون من تطبيق الهاتف."""
+    text: str | None = None
+    message: str | None = None
+    client_phone: str | None = ""
+    client_name: str | None = ""
+    sender: str | None = "client"
+
+
+def save_client_message(order_id: str, payload: ClientMessageData):
+    """
+    يحفظ رد الزبون داخل نفس وثيقة الطلب في Firestore.
+    يخزن الرسالة في messages ويعلّم الطلب أنه فيه رسالة زبون غير مقروءة للأدمن.
+    """
+    try:
+        doc_ref = db.collection("orders").document(order_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        data = doc.to_dict() or {}
+
+        text = safe_strip(payload.text or payload.message)
+        if not text:
+            raise HTTPException(status_code=400, detail="Message is empty")
+
+        # حماية بسيطة: إذا الهاتف مرسل من التطبيق، نتحقق أنه نفس صاحب الطلب.
+        received_phone = normalize_phone(payload.client_phone or "")
+        stored_phone = normalize_phone(
+            data.get("client_phone") or data.get("client_phone_raw") or ""
+        )
+
+        if received_phone and stored_phone and received_phone != stored_phone:
+            raise HTTPException(status_code=403, detail="Phone does not match this order")
+
+        now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now_iso = datetime.now().isoformat()
+
+        message_item = {
+            "id": str(uuid.uuid4()),
+            "sender": safe_strip(payload.sender or "client") or "client",
+            "sender_name": safe_strip(payload.client_name or data.get("client_name") or "Client"),
+            "text": text,
+            "created_at": now_text,
+            "created_at_iso": now_iso,
+        }
+
+        doc_ref.update({
+            "messages": firestore.ArrayUnion([message_item]),
+            "client_last_reply": text,
+            "client_last_reply_at": now_text,
+            "client_last_reply_ts": firestore.SERVER_TIMESTAMP,
+            "has_unread_client_message": True,
+        })
+
+        return {
+            "success": True,
+            "message": "Réponse envoyée avec succès",
+            "order_id": order_id,
+            "saved_message": message_item,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/")
 def health_check():
     return {
         "success": True,
         "service": "ATM TRUCK API",
         "status": "online",
-        "version": "1.1.0"
+        "version": "1.2.0"
     }
 
 
@@ -169,6 +238,8 @@ def create_order(order: OrderData):
             "created_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
             "created_at_ts": firestore.SERVER_TIMESTAMP,
             "source": "client_app",
+            "messages": [],
+            "has_unread_client_message": False,
             "response": {
                 "status": "pending",
                 "message": "En attente de traitement",
@@ -186,6 +257,30 @@ def create_order(order: OrderData):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/orders/{order_id}/messages")
+def add_order_message(order_id: str, payload: ClientMessageData):
+    return save_client_message(order_id, payload)
+
+
+@app.post("/orders/{order_id}/reply")
+def add_order_reply(order_id: str, payload: ClientMessageData):
+    return save_client_message(order_id, payload)
+
+
+@app.post("/orders/{order_id}/client-reply")
+def add_client_reply(order_id: str, payload: ClientMessageData):
+    return save_client_message(order_id, payload)
+
+
+@app.post("/orders/{order_id}")
+def add_client_reply_compat(order_id: str, payload: ClientMessageData):
+    """
+    Compatibility endpoint:
+    إذا تطبيق الهاتف جرب POST مباشرة على /orders/{order_id}، نخليه يخدم كذلك.
+    """
+    return save_client_message(order_id, payload)
 
 
 @app.get("/orders/{phone}")
