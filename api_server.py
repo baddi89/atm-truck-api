@@ -132,10 +132,23 @@ class OrderData(BaseModel):
     location_to: str = Field(..., min_length=1)
     cargo: str = ""
     truck: str = ""
+    # Champs structurés pour dashboard / export Excel.
+    # On garde plusieurs noms compatibles avec les anciennes versions du client.
+    truck_type: str | None = ""
+    truck_count: str | None = ""
+    truck_quantity: str | None = ""
+    number_of_trucks: str | None = ""
+    duration_days: str | None = ""
+    transport_days: str | None = ""
+    estimated_days: str | None = ""
+    cargo_insurance_da: str | None = ""
+    insurance_da: str | None = ""
+    assurance_marchandise: str | None = ""
     date: str = ""
     time: str = ""
     manutention: str | None = None
     person_count: str | None = ""
+    # admin_note reste seulement pour une vraie note libre, pas pour stocker les détails techniques.
     admin_note: str | None = ""
 
 
@@ -482,6 +495,12 @@ def create_order(order: OrderData):
         order_id = str(uuid.uuid4())
         normalized_phone = normalize_phone(order.client_phone)
 
+        truck_type_value = safe_strip(order.truck_type or order.truck)
+        truck_count_value = safe_strip(order.truck_count or order.truck_quantity or order.number_of_trucks or "1")
+        duration_days_value = safe_strip(order.duration_days or order.transport_days or order.estimated_days)
+        cargo_insurance_value = safe_strip(order.cargo_insurance_da or order.insurance_da or order.assurance_marchandise)
+        admin_note_value = safe_strip(order.admin_note)
+
         data = {
             "client_name": safe_strip(order.client_name),
             "client_phone": normalized_phone,
@@ -490,12 +509,23 @@ def create_order(order: OrderData):
             "location_from": safe_strip(order.location_from),
             "location_to": safe_strip(order.location_to),
             "cargo": safe_strip(order.cargo),
-            "truck": safe_strip(order.truck),
+            # Champs séparés pour affichage dashboard et export Excel propre.
+            "truck": truck_type_value,
+            "truck_type": truck_type_value,
+            "truck_count": truck_count_value,
+            "truck_quantity": truck_count_value,
+            "number_of_trucks": truck_count_value,
+            "duration_days": duration_days_value,
+            "transport_days": duration_days_value,
+            "estimated_days": duration_days_value,
+            "cargo_insurance_da": cargo_insurance_value,
+            "insurance_da": cargo_insurance_value,
+            "assurance_marchandise": cargo_insurance_value,
             "date": safe_strip(order.date),
             "time": safe_strip(order.time),
             "manutention": order.manutention,
             "person_count": order.person_count or "",
-            "admin_note": order.admin_note or "",
+            "admin_note": admin_note_value,
             "created_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
             "created_at_ts": firestore.SERVER_TIMESTAMP,
             "source": "client_app",
