@@ -3,6 +3,7 @@ import json
 import uuid
 import re
 from datetime import datetime
+from typing import Any
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="ATM TRUCK API", version="1.2.1")
+app = FastAPI(title="ATM TRUCK API", version="1.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -140,11 +141,15 @@ class OrderData(BaseModel):
 
 class ClientMessageData(BaseModel):
     """Payload تاع رسالة الزبون من تطبيق الهاتف."""
-    text: str | None = None
-    message: str | None = None
+    text: Any = None
+    message: Any = None
     client_phone: str | None = ""
     client_name: str | None = ""
     sender: str | None = "client"
+    type: str | None = None
+
+    class Config:
+        extra = "allow"
 
 
 class PrivacyConsentData(BaseModel):
@@ -165,6 +170,116 @@ class PrivacyConsentData(BaseModel):
 
     class Config:
         extra = "allow"
+
+
+
+
+class TransportCompletionData(BaseModel):
+    """Payload تاع تأكيد الزبون أن النقل تم بنجاح."""
+    sender: str | None = "client"
+    type: str | None = "transport_completed_confirmation"
+    message: Any = None
+    text: Any = None
+    client_phone: str | None = ""
+    client_name: str | None = ""
+    transport_completed: bool | None = True
+
+    class Config:
+        extra = "allow"
+
+
+def extract_text_value(value, default=""):
+    """يستخرج النص حتى إذا التطبيق أرسل message كـ dict."""
+    if isinstance(value, dict):
+        return safe_strip(value.get("message") or value.get("text") or default)
+    return safe_strip(value or default)
+
+
+def nested_message_dict(payload) -> dict:
+    try:
+        message = getattr(payload, "message", None)
+        if isinstance(message, dict):
+            return message
+    except Exception:
+        pass
+    return {}
+
+
+def is_transport_completion_payload(payload) -> bool:
+    """يتعرف على تأكيد إتمام النقل ولو جاء داخل message."""
+    msg = nested_message_dict(payload)
+    try:
+        payload_dict = model_to_dict(payload)
+    except Exception:
+        payload_dict = {}
+
+    payload_type = safe_strip(payload_dict.get("type") or msg.get("type")).lower()
+    return (
+        payload_type == "transport_completed_confirmation"
+        or bool(payload_dict.get("transport_completed"))
+        or bool(msg.get("transport_completed"))
+    )
+
+
+def save_transport_completion(order_id: str, payload: TransportCompletionData):
+    """يحفظ تأكيد الزبون أن النقل تم بنجاح داخل وثيقة الطلب."""
+    try:
+        doc_ref = db.collection("orders").document(order_id)
+        doc = doc_ref.get()
+
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        data = doc.to_dict() or {}
+        payload_dict = model_to_dict(payload)
+
+        received_phone = normalize_phone(payload.client_phone or payload_dict.get("client_phone") or "")
+        stored_phone = normalize_phone(data.get("client_phone") or data.get("client_phone_raw") or "")
+
+        if received_phone and stored_phone and received_phone != stored_phone:
+            raise HTTPException(status_code=403, detail="Phone does not match this order")
+
+        now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now_iso = datetime.now().isoformat()
+        message_text = extract_text_value(
+            payload.text,
+            extract_text_value(payload.message, "Transport terminé avec succès confirmé par le client."),
+        )
+
+        message_item = {
+            "id": str(uuid.uuid4()),
+            "sender": safe_strip(payload.sender or "client") or "client",
+            "sender_name": safe_strip(payload.client_name or data.get("client_name") or "Client"),
+            "type": "transport_completed_confirmation",
+            "text": message_text,
+            "message": message_text,
+            "created_at": now_text,
+            "created_at_iso": now_iso,
+        }
+
+        doc_ref.update({
+            "transport_completed": True,
+            "client_confirmed_transport": True,
+            "transport_completed_at": now_text,
+            "transport_completed_at_iso": now_iso,
+            "transport_completed_ts": firestore.SERVER_TIMESTAMP,
+            "client_transport_confirmation": message_item,
+            "messages": firestore.ArrayUnion([message_item]),
+            "has_unread_client_message": True,
+        })
+
+        return {
+            "success": True,
+            "message": "Confirmation du transport enregistrée avec succès",
+            "order_id": order_id,
+            "transport_completed": True,
+            "saved_message": message_item,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def save_privacy_consent(payload: PrivacyConsentData, phone: str | None = None):
@@ -225,9 +340,19 @@ def save_privacy_consent(payload: PrivacyConsentData, phone: str | None = None):
 def save_client_message(order_id: str, payload: ClientMessageData):
     """
     يحفظ رد الزبون داخل نفس وثيقة الطلب في Firestore.
-    يخزن الرسالة في messages ويعلّم الطلب أنه فيه رسالة زبون غير مقروءة للأدمن.
+    إذا كانت الرسالة تأكيد إتمام النقل، يحفظها كـ transport_completed كذلك.
     """
     try:
+        if is_transport_completion_payload(payload):
+            msg = nested_message_dict(payload)
+            merged = {}
+            try:
+                merged.update(model_to_dict(payload))
+            except Exception:
+                pass
+            merged.update({k: v for k, v in msg.items() if v not in [None, ""]})
+            return save_transport_completion(order_id, TransportCompletionData(**merged))
+
         doc_ref = db.collection("orders").document(order_id)
         doc = doc_ref.get()
 
@@ -236,7 +361,7 @@ def save_client_message(order_id: str, payload: ClientMessageData):
 
         data = doc.to_dict() or {}
 
-        text = safe_strip(payload.text or payload.message)
+        text = extract_text_value(payload.text, extract_text_value(payload.message, ""))
         if not text:
             raise HTTPException(status_code=400, detail="Message is empty")
 
@@ -256,7 +381,9 @@ def save_client_message(order_id: str, payload: ClientMessageData):
             "id": str(uuid.uuid4()),
             "sender": safe_strip(payload.sender or "client") or "client",
             "sender_name": safe_strip(payload.client_name or data.get("client_name") or "Client"),
+            "type": safe_strip(payload.type or "client_reply") or "client_reply",
             "text": text,
+            "message": text,
             "created_at": now_text,
             "created_at_iso": now_iso,
         }
@@ -288,7 +415,7 @@ def health_check():
         "success": True,
         "service": "ATM TRUCK API",
         "status": "online",
-        "version": "1.2.1"
+        "version": "1.2.2"
     }
 
 
@@ -415,6 +542,30 @@ def add_client_reply_compat(order_id: str, payload: ClientMessageData):
     إذا تطبيق الهاتف جرب POST مباشرة على /orders/{order_id}، نخليه يخدم كذلك.
     """
     return save_client_message(order_id, payload)
+
+
+
+
+@app.post("/orders/{order_id}/message")
+def add_order_message_singular(order_id: str, payload: ClientMessageData):
+    # Compatibility endpoint إذا التطبيق استعمل /message بدل /messages.
+    return save_client_message(order_id, payload)
+
+
+@app.post("/orders/{order_id}/transport-completed")
+def confirm_order_transport_completed(order_id: str, payload: TransportCompletionData):
+    return save_transport_completion(order_id, payload)
+
+
+@app.patch("/orders/{order_id}/transport-completed")
+def patch_order_transport_completed(order_id: str, payload: TransportCompletionData):
+    return save_transport_completion(order_id, payload)
+
+
+@app.patch("/orders/{order_id}")
+def patch_order_compat(order_id: str, payload: TransportCompletionData):
+    # Compatibility مع التطبيق إذا استعمل PATCH /orders/{id}.
+    return save_transport_completion(order_id, payload)
 
 
 @app.get("/orders/{phone}")
