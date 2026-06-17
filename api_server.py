@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="ATM TRUCK API", version="1.2.0")
+app = FastAPI(title="ATM TRUCK API", version="1.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,6 +106,14 @@ def safe_strip(value):
     return str(value or "").strip()
 
 
+def model_to_dict(model):
+    """Compatible Pydantic v1/v2 dict conversion."""
+    try:
+        return model.model_dump()
+    except Exception:
+        return model.dict()
+
+
 def parse_created_at(order: dict):
     """ترتيب احتياطي إذا لم نستعمل order_by من Firestore."""
     created_at = order.get("created_at", "")
@@ -137,6 +145,81 @@ class ClientMessageData(BaseModel):
     client_phone: str | None = ""
     client_name: str | None = ""
     sender: str | None = "client"
+
+
+class PrivacyConsentData(BaseModel):
+    """
+    Payload تاع موافقة الزبون على استعمال المعطيات الشخصية.
+    يتسجل في Firestore collection اسمها trucks، وليس في orders.
+    """
+    client_name: str | None = ""
+    client_phone: str = Field(..., min_length=6)
+    company: str | None = ""
+    privacy_consent_accepted: bool = True
+    privacy_consent_accepted_at: str | None = ""
+    law_reference: str | None = ""
+    consent_text: str | None = ""
+    app_version: str | None = ""
+    app_version_code: int | None = None
+    source: str | None = "client_app"
+
+    class Config:
+        extra = "allow"
+
+
+def save_privacy_consent(payload: PrivacyConsentData, phone: str | None = None):
+    """
+    يحفظ قبول قانون حماية المعطيات في collection اسمها trucks.
+    نستعمل رقم الهاتف كـ document id حتى لا يتكرر القبول لنفس الزبون.
+    """
+    try:
+        raw_phone = phone or payload.client_phone
+        normalized_phone = normalize_phone(raw_phone)
+
+        if not normalized_phone:
+            raise HTTPException(status_code=400, detail="Client phone is required")
+
+        payload_dict = model_to_dict(payload)
+        now_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now_iso = datetime.now().isoformat()
+
+        data = {
+            "client_name": safe_strip(payload.client_name),
+            "client_phone": normalized_phone,
+            "client_phone_raw": safe_strip(payload.client_phone),
+            "company": safe_strip(payload.company),
+            "privacy_consent_accepted": bool(payload.privacy_consent_accepted),
+            "privacy_consent_accepted_at": safe_strip(payload.privacy_consent_accepted_at) or now_text,
+            "privacy_consent_accepted_at_iso": now_iso,
+            "privacy_consent_ts": firestore.SERVER_TIMESTAMP,
+            "law_reference": safe_strip(payload.law_reference),
+            "consent_text": safe_strip(payload.consent_text),
+            "app_version": safe_strip(payload.app_version),
+            "app_version_code": payload.app_version_code,
+            "source": safe_strip(payload.source) or "client_app",
+            "updated_at": now_text,
+            "updated_at_ts": firestore.SERVER_TIMESTAMP,
+        }
+
+        # نحافظ على أي حقول إضافية مرسلة من التطبيق بدون حذف القديم.
+        for key, value in payload_dict.items():
+            if key not in data and value not in [None, ""]:
+                data[key] = value
+
+        db.collection("trucks").document(normalized_phone).set(data, merge=True)
+
+        return {
+            "success": True,
+            "message": "Privacy consent saved in trucks",
+            "collection": "trucks",
+            "document_id": normalized_phone,
+            "client_phone": normalized_phone,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def save_client_message(order_id: str, payload: ClientMessageData):
@@ -205,7 +288,7 @@ def health_check():
         "success": True,
         "service": "ATM TRUCK API",
         "status": "online",
-        "version": "1.2.0"
+        "version": "1.2.1"
     }
 
 
@@ -213,6 +296,57 @@ def health_check():
 def health_check_head():
     # لتفادي ظهور 405 Method Not Allowed في Render Health Check.
     return None
+
+
+@app.post("/trucks/privacy-consent")
+def create_truck_privacy_consent(payload: PrivacyConsentData):
+    return save_privacy_consent(payload)
+
+
+@app.post("/trucks/consent")
+def create_truck_consent(payload: PrivacyConsentData):
+    return save_privacy_consent(payload)
+
+
+@app.post("/trucks/{phone}/privacy-consent")
+def create_truck_privacy_consent_by_phone(phone: str, payload: PrivacyConsentData):
+    return save_privacy_consent(payload, phone=phone)
+
+
+@app.post("/trucks/{phone}")
+def update_truck_by_phone(phone: str, payload: PrivacyConsentData):
+    return save_privacy_consent(payload, phone=phone)
+
+
+@app.post("/trucks")
+def create_truck_record(payload: PrivacyConsentData):
+    # Compatibility مع تطبيق الهاتف إذا جرب POST /trucks مباشرة.
+    return save_privacy_consent(payload)
+
+
+@app.get("/trucks/{phone}")
+def get_truck_privacy_consent(phone: str):
+    try:
+        normalized_phone = normalize_phone(phone)
+        doc = db.collection("trucks").document(normalized_phone).get()
+
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Truck/client record not found")
+
+        data = doc.to_dict() or {}
+        data["id"] = doc.id
+
+        return {
+            "success": True,
+            "phone_received": phone,
+            "phone_normalized": normalized_phone,
+            "truck": data,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/orders")
